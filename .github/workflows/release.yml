@@ -1,15 +1,16 @@
 name: Release
 
 # Triggered by the v<version> tags pushed by the Promote workflow.
-# Validates the tag, builds the docker image and pushes it to AWS ECR.
+# Validates the tag, builds the docker image, pushes it to AWS ECR and then
+# sends a deployment message to SQS only after the push step succeeds.
 #
 # This workflow never bumps a version and never runs the check suite - the tag
 # only exists because Promote passed both.
 #
 # Runner: this repository has no self-hosted runner registered, so every job
 # runs on the GitHub-hosted `ubuntu-latest`. That runner is not the deployment
-# host and has no deploy script on it, so the release stops at the ECR push -
-# there is no deploy job. When a trusted self-hosted runner is registered, swap
+# host and has no deploy script on it, so deployment is requested through SQS -
+# there is no local deploy job. When a trusted self-hosted runner is registered, swap
 # `runs-on` and add the deploy job described in
 # ai-blueprint/skills/devops/github-actions/template-release.yml.
 #
@@ -102,6 +103,7 @@ jobs:
             .
 
       - name: Push the image to Amazon ECR
+        id: push-ecr
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ steps.meta.outputs.repository }}
@@ -109,6 +111,25 @@ jobs:
         run: |
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+      - name: Send deployment message to SQS
+        if: ${{ success() && steps.push-ecr.outcome == 'success' }}
+        env:
+          ECR_REPOSITORY: ${{ steps.meta.outputs.repository }}
+          IMAGE_TAG: ${{ steps.meta.outputs.version }}
+        run: |
+          MESSAGE_BODY="$(jq -cn \
+            --arg repo "$ECR_REPOSITORY" \
+            --arg version "$IMAGE_TAG" \
+            '{repo: $repo, version: $version}')"
+
+          aws sqs send-message \
+            --region eu-central-1 \
+            --queue-url "https://sqs.eu-central-1.amazonaws.com/069691036768/deploy-ecr.fifo" \
+            --message-group-id "$ECR_REPOSITORY" \
+            --message-deduplication-id "${ECR_REPOSITORY}-${IMAGE_TAG}" \
+            --message-body "$MESSAGE_BODY" \
+            --output text --query MessageId
 
       - name: Summary
         env:
@@ -119,5 +140,5 @@ jobs:
             echo "### Pushed \`${ECR_REPOSITORY}:${IMAGE_TAG}\` to ECR"
             echo ""
             echo "- Also tagged \`latest\`"
-            echo "- No deploy job: this repository has no self-hosted runner yet"
+            echo "- Deployment message sent to SQS"
           } >> "$GITHUB_STEP_SUMMARY"
